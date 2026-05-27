@@ -1,7 +1,9 @@
 import os
 import io
 import textwrap
-from flask import Flask
+import asyncio
+import threading
+from flask import Flask, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from PIL import Image, ImageDraw, ImageFont
@@ -18,12 +20,12 @@ flask_app = Flask(__name__)
 @flask_app.route('/')
 @flask_app.route('/health')
 def health_check():
-    return "Meme Bot is running!", 200
+    return jsonify({"status": "ok", "service": "Meme Bot"}), 200
 
 # === MEME GENERATION FUNCTIONS ===
 def download_image(url):
     """Download image from URL"""
-    response = requests.get(url)
+    response = requests.get(url, timeout=30)
     response.raise_for_status()
     return Image.open(io.BytesIO(response.content))
 
@@ -50,7 +52,7 @@ def wrap_text(text, font, max_width):
     
     return lines
 
-def draw_text_with_outline(draw, text, position, font, fill, outline_color='black', outline_width=2):
+def draw_text_with_outline(draw, text, position, font, fill='white', outline_color='black', outline_width=2):
     """Draw text with black outline for better visibility"""
     x, y = position
     
@@ -69,58 +71,69 @@ def create_meme(template_name, top_text, bottom_text):
     if not template:
         return None
     
-    # Download and prepare image
-    img = download_image(template["url"])
-    img = img.convert('RGBA')
-    
-    # Create drawing context
-    draw = ImageDraw.Draw(img)
-    
-    # Load fonts (using default font with increased size)
     try:
-        # Try to load a better font if available
-        font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-        top_font = ImageFont.truetype(font_path, 50) if os.path.exists(font_path) else ImageFont.load_default()
-        bottom_font = ImageFont.truetype(font_path, 50) if os.path.exists(font_path) else ImageFont.load_default()
-    except:
-        top_font = ImageFont.load_default()
-        bottom_font = ImageFont.load_default()
-    
-    img_width = img.width
-    
-    # Add top text
-    if top_text:
-        wrapped_top = textwrap.wrap(top_text.upper(), width=20)
-        y_offset = template["top_y"]
+        # Download and prepare image
+        img = download_image(template["url"])
+        img = img.convert('RGBA')
         
-        for line in wrapped_top:
-            bbox = top_font.getbbox(line)
-            text_width = bbox[2] - bbox[0]
-            x_position = (img_width - text_width) // 2
-            draw_text_with_outline(draw, line, (x_position, y_offset), top_font, 'white')
-            y_offset += 55
-    
-    # Add bottom text
-    if bottom_text:
-        wrapped_bottom = textwrap.wrap(bottom_text.upper(), width=20)
-        y_offset = template["bottom_y"]
+        # Create drawing context
+        draw = ImageDraw.Draw(img)
         
-        for line in wrapped_bottom:
-            bbox = bottom_font.getbbox(line)
-            text_width = bbox[2] - bbox[0]
-            x_position = (img_width - text_width) // 2
-            draw_text_with_outline(draw, line, (x_position, y_offset), bottom_font, 'white')
-            y_offset += 55
-    
-    # Convert back to RGB for saving
-    img = img.convert('RGB')
-    
-    # Save to bytes
-    img_bytes = io.BytesIO()
-    img.save(img_bytes, format='PNG')
-    img_bytes.seek(0)
-    
-    return img_bytes
+        # Load fonts - use default with larger size
+        try:
+            # Try to use a standard font if available
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 60)
+        except:
+            # Fall back to default font
+            font = ImageFont.load_default()
+        
+        img_width = img.width
+        
+        # Add top text
+        if top_text:
+            wrapped_top = textwrap.wrap(top_text.upper(), width=20)
+            y_offset = template["top_y"]
+            
+            for line in wrapped_top:
+                try:
+                    bbox = font.getbbox(line)
+                    text_width = bbox[2] - bbox[0]
+                except:
+                    text_width = len(line) * 15  # Approximate width
+                
+                x_position = (img_width - text_width) // 2
+                draw_text_with_outline(draw, line, (x_position, y_offset), font, 'white')
+                y_offset += 65
+        
+        # Add bottom text
+        if bottom_text:
+            wrapped_bottom = textwrap.wrap(bottom_text.upper(), width=20)
+            y_offset = template["bottom_y"]
+            
+            for line in wrapped_bottom:
+                try:
+                    bbox = font.getbbox(line)
+                    text_width = bbox[2] - bbox[0]
+                except:
+                    text_width = len(line) * 15
+                
+                x_position = (img_width - text_width) // 2
+                draw_text_with_outline(draw, line, (x_position, y_offset), font, 'white')
+                y_offset += 65
+        
+        # Convert back to RGB for saving
+        img = img.convert('RGB')
+        
+        # Save to bytes
+        img_bytes = io.BytesIO()
+        img.save(img_bytes, format='PNG')
+        img_bytes.seek(0)
+        
+        return img_bytes
+        
+    except Exception as e:
+        print(f"Error creating meme: {e}")
+        return None
 
 # === TELEGRAM BOT HANDLERS ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -144,7 +157,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(welcome_text, parse_mode='Markdown')
 
 async def show_templates(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show available meme templates with preview links"""
+    """Show available meme templates with preview buttons"""
     templates_list = "\n".join([f"• `{name}` - {data['name']}" for name, data in TEMPLATES.items()])
     
     message = (
@@ -181,10 +194,16 @@ async def generate_meme(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Check if user specified two texts with pipe
     if '|' in args:
-        template_name = args.split()[0]
-        text_parts = args.split('|')
-        top_text = text_parts[0].replace(template_name, '').strip()
-        bottom_text = text_parts[1].strip() if len(text_parts) > 1 else ""
+        parts = args.split('|')
+        first_part = parts[0].strip()
+        words = first_part.split()
+        if len(words) == 0:
+            await update.message.reply_text("❌ Please specify a template name!")
+            return
+        
+        template_name = words[0]
+        top_text = ' '.join(words[1:])
+        bottom_text = parts[1].strip() if len(parts) > 1 else ""
     else:
         # Simple format: /meme template text
         parts = args.split(' ', 1)
@@ -218,16 +237,22 @@ async def generate_meme(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if meme_bytes:
             # Send meme as photo
+            caption = f"🎭 Template: {TEMPLATES[template_name]['name']}"
+            if top_text:
+                caption += f"\n📝 Top: {top_text}"
+            if bottom_text:
+                caption += f"\n📝 Bottom: {bottom_text}"
+            
             await update.message.reply_photo(
                 photo=meme_bytes,
-                caption=f"🎭 Your meme from template: {TEMPLATES[template_name]['name']}\n\n📝 Top: {top_text}\n📝 Bottom: {bottom_text}" if bottom_text else f"🎭 Your meme from template: {TEMPLATES[template_name]['name']}\n\n📝 Text: {top_text}"
+                caption=caption
             )
             await processing_msg.delete()
         else:
-            await update.message.reply_text("❌ Failed to generate meme. Please try again.")
+            await update.message.reply_text("❌ Failed to generate meme. Please try again with different text.")
             
     except Exception as e:
-        await update.message.reply_text(f"❌ Error generating meme: {str(e)}")
+        await update.message.reply_text(f"❌ Error: Could not generate meme. Please try again.")
         print(f"Error: {e}")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -243,10 +268,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Examples:*\n"
         "• `/meme drake Music | Coding`\n"
         "• `/meme two_buttons Go to bed | Code all night`\n"
-        "• `/meme distracted Me doing homework | My brain doing nothing`\n\n"
+        "• `/meme distracted Me doing homework | My brain`\n\n"
         "*Pro tip:* Use the vertical bar `|` to separate top and bottom text!"
     )
     await update.message.reply_text(help_text, parse_mode='Markdown')
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors"""
+    print(f"Error: {context.error}")
+    if update and update.effective_message:
+        await update.effective_message.reply_text("An error occurred. Please try again.")
 
 # === MAIN FUNCTION ===
 async def main():
@@ -259,6 +290,7 @@ async def main():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("templates", show_templates))
     application.add_handler(CommandHandler("meme", generate_meme))
+    application.add_error_handler(error_handler)
     
     # Start bot with polling
     print("🤖 Meme Bot is starting...")
@@ -266,7 +298,7 @@ async def main():
     await application.start()
     await application.updater.start_polling()
     
-    print("✅ Meme Bot is running!")
+    print("✅ Meme Bot is running successfully!")
     
     # Keep bot running
     try:
@@ -281,9 +313,6 @@ async def main():
 
 # === ENTRY POINT ===
 if __name__ == "__main__":
-    import asyncio
-    import threading
-    
     # Run Flask in a separate thread for health checks
     def run_flask():
         flask_app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
