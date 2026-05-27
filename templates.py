@@ -1,12 +1,10 @@
 # Meme templates database
-# Each template: (image_url, top_text_y, bottom_text_y, max_width)
-
 TEMPLATES = {
     "drake": {
         "name": "Drake Hotline Bling",
         "url": "https://i.imgflip.com/30b1gx.jpg",
-        "top_y": 50,      # Y position for top text
-        "bottom_y": 450,   # Y position for bottom text  
+        "top_y": 50,
+        "bottom_y": 450,
         "max_width": 450
     },
     "distracted": {
